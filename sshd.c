@@ -431,7 +431,7 @@ sshd_exchange_identification(int sock_in, int sock_out)
 	}
 
 	xasprintf(&server_version_string, "SSH-%d.%d-%.100s%s%s%s",
-	    major, minor, SSH_VERSION,
+	    major, minor, SSH_RELEASE,
 	    *options.version_addendum == '\0' ? "" : " ",
 	    options.version_addendum, newline);
 
@@ -483,6 +483,9 @@ sshd_exchange_identification(int sock_in, int sock_out)
 		cleanup_exit(255);
 	}
 	debug("Client protocol version %d.%d; client software version %.100s",
+	    remote_major, remote_minor, remote_version);
+	logit("SSH: Server;Ltype: Version;Remote: %s-%d;Protocol: %d.%d;Client: %.100s",
+	      get_remote_ipaddr(), get_remote_port(),
 	    remote_major, remote_minor, remote_version);
 
 	active_state->compat = compat_datafellows(remote_version);
@@ -1160,6 +1163,8 @@ server_listen(void)
 	int ret, listen_sock, on = 1;
 	struct addrinfo *ai;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+	int socksize;
+	int socksizelen = sizeof(int);
 
 	for (ai = options.listen_addrs; ai; ai = ai->ai_next) {
 		if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
@@ -1199,6 +1204,11 @@ server_listen(void)
 			sock_set_v6only(listen_sock);
 
 		debug("Bind to port %s on %s.", strport, ntop);
+
+		getsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF,
+				   &socksize, &socksizelen);
+		debug("Server TCP RWIN socket size: %d", socksize);
+		debug("HPN Buffer Size: %d", options.hpn_buffer_size);
 
 		/* Bind the socket to the desired port. */
 		if (bind(listen_sock, ai->ai_addr, ai->ai_addrlen) < 0) {
@@ -1699,6 +1709,13 @@ main(int ac, char **av)
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
 
+	if (options.none_enabled == 1) {
+		char *old_ciphers = options.ciphers;
+
+		xasprintf(&options.ciphers, "%s,none", old_ciphers);
+		free(old_ciphers);
+	}
+
 	/* challenge-response is implemented via keyboard interactive */
 	if (options.challenge_response_authentication)
 		options.kbd_interactive_authentication = 1;
@@ -2151,6 +2168,9 @@ main(int ac, char **av)
 	    remote_ip, remote_port, laddr,  get_local_port());
 	free(laddr);
 
+	/* set the HPN options for the child */
+	channel_set_hpn(options.hpn_disabled, options.hpn_buffer_size);
+
 	/*
 	 * We don't want to listen forever unless the other side
 	 * successfully authenticates itself.  So we set up an alarm which is
@@ -2265,6 +2285,24 @@ main(int ac, char **av)
 		notify_hostkeys(active_state);
 
 	/* Start session. */
+
+#ifdef WITH_OPENSSL
+	/* if we are using aes-ctr there can be issues in either a fork or sandbox
+	 * so the initial aes-ctr is defined to point ot the original single process
+	 * evp. After authentication we'll be past the fork and the sandboxed privsep
+	 * so we repoint the define to the multithreaded evp. To start the threads we
+	 * then force a rekey
+	 */
+	struct sshcipher_ctx *ccsend = ssh_packet_get_send_context(active_state);
+
+	/* only rekey if necessary. If we don't do this gcm mode cipher breaks */
+	if (strstr(cipher_return_name(ccsend->cipher), "ctr")) {
+		debug("Single to Multithreaded CTR cipher swap - server request");
+		cipher_reset_multithreaded();
+		packet_request_rekeying();
+	}
+#endif
+
 	do_authenticated(authctxt);
 
 	/* The connection has been terminated. */
@@ -2546,6 +2584,9 @@ do_ssh2_kex(void)
 	char *myproposal[PROPOSAL_MAX] = { KEX_SERVER };
 	struct kex *kex;
 	int r;
+
+	if (options.none_enabled == 1)
+		debug("WARNING: None cipher enabled");
 
 	myproposal[PROPOSAL_KEX_ALGS] = compat_kex_proposal(
 	    options.kex_algorithms);
